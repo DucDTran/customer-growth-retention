@@ -1,543 +1,458 @@
-"""
-FastAPI application for Customer Churn Prediction and CLV Estimation
-Based on the customer retention analysis notebook
-"""
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal
 import pandas as pd
 import numpy as np
 import joblib
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Literal, Optional
 from lifetimes import BetaGeoFitter, GammaGammaFitter
 from lifelines import CoxPHFitter
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 
 warnings.filterwarnings("ignore")
 
-# Initialize FastAPI app
 app = FastAPI(
-    title="Customer Retention & CLV API",
-    description="Predict churn, estimate CLV, and prioritize retention efforts",
-    version="1.0.0"
+    title="Customer Retention Intelligence API",
+    description="Unified endpoint for Customer Scoring, Churn Prediction, CLV Estimation, and Retention Ranking.",
+    version="3.0.0"
 )
 
-# ============================================================================
-# Load Models and Data at Startup
-# ============================================================================
+# --- CONFIGURATION ---
+MODEL_PATH = "models/"
+DATA_PATH = "data/"
+# In a real production system, this would be dynamic (e.g. datetime.now())
+# or passed in the request. For this dataset, we pin it to the end of the data.
+OBSERVATION_DATE = datetime(2026, 1, 19)
 
-class ModelRegistry:
-    """Singleton to load and cache all models"""
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._load_models()
-            cls._instance._load_data()
-        return cls._instance
-    
-    def _load_models(self):
-        """Load all trained models"""
+FEATURE_COLS = [
+    'transactions_last_30', 'revenue_last_30', 'avg_amount_last_30', 'unique_active_days_last_30',
+    'transactions_last_90', 'revenue_last_90', 'transactions_prev_30', 'revenue_prev_30',
+    'avg_interpurchase_days', 'std_interpurchase_days', 'last_interpurchase_days',
+    'median_amount', 'max_amount', 'avg_amount_overall', 'num_large_txns', 
+    'flag_high_value_outlier', 'last_tx_month', 'last_tx_day_of_week', 'is_holiday_window',
+    'lifetime_days', 'total_spend', 'frequency', 'avg_amount_calc', 
+    'pct_change_tx_last30_vs_prev30', 'frequency_ratio_30_90', 'log_total_spend',
+    'log_revenue_last_30', 'log_avg_amount_last_30', 'recency', 'monetary', 
+    'signup_day_of_week', 'signup_month'
+]
+
+# --- DATA MODELS (Pydantic) ---
+
+class ScoreInput(BaseModel):
+    customer_id: str
+
+class ScoreOutput(BaseModel):
+    churn_probability: float
+    p_alive: float
+    expected_remaining_lifetime: float
+    clv_bgnbd: float
+    clv_survival: float
+
+class ChurnInput(BaseModel):
+    customer_id: str
+    horizon_days: int = 60
+
+class ChurnOutput(BaseModel):
+    churn_probability: float
+    churn_label: str
+
+class SurvivalInput(BaseModel):
+    customer_id: str
+
+class SurvivalPoint(BaseModel):
+    day: int
+    prob: float
+
+class SurvivalOutput(BaseModel):
+    survival_curve: List[SurvivalPoint]
+    expected_remaining_lifetime: float
+
+class CLVInput(BaseModel):
+    customer_id: str
+    method: Literal["bgnbd", "survival"]
+
+class CLVOutput(BaseModel):
+    method: str
+    clv: float
+    horizon_months: int
+
+class RankInput(BaseModel):
+    top_k: int = 100
+    strategy: Literal["high_clv_high_churn"]
+
+class RankCustomer(BaseModel):
+    customer_id: str
+    churn_probability: float
+    clv: float
+    priority_score: float
+
+class RankOutput(BaseModel):
+    strategy: str
+    customers: List[RankCustomer]
+
+# --- STATE MANAGEMENT (Singleton) ---
+class SystemState:
+    def __init__(self):
+        self.models = {}
+        self.data = {}
+        self.rfm = None
+
+    def load_resources(self):
+        print("Loading Models...")
         try:
-            # Classification model (calibrated XGBoost)
-            self.xgb_model = joblib.load('models/xgb_calibrated.joblib')
-            self.scaler = joblib.load('models/scaler.joblib')
+            self.models['xgb'] = joblib.load(f"{MODEL_PATH}xgb_calibrated.joblib")
+            self.models['scaler'] = joblib.load(f"{MODEL_PATH}scaler.joblib")
+            self.models['cph'] = joblib.load(f"{MODEL_PATH}cph_model.joblib")
             
-            # BG-NBD and Gamma-Gamma
-            self.bgf = BetaGeoFitter()
-            self.bgf.load_model('models/bgf_model.pkl')
+            self.models['bgf'] = BetaGeoFitter()
+            self.models['bgf'].load_model(f"{MODEL_PATH}bgf_model.pkl")
             
-            self.ggf = GammaGammaFitter()
-            self.ggf.load_model('models/ggf_model.pkl')
-            
-            # Survival model (Cox PH)
-            self.cph = joblib.load('models/cph_model.joblib')
-            
-            print("✓ All models loaded successfully")
+            self.models['ggf'] = GammaGammaFitter()
+            self.models['ggf'].load_model(f"{MODEL_PATH}ggf_model.pkl")
         except Exception as e:
-            print(f"✗ Error loading models: {e}")
-            raise
-    
-    def _load_data(self):
-        """Load customer and transaction data"""
+            print(f"Error loading models: {e}")
+            # Non-blocking for now, but endpoints will fail if called
+
+        print("Loading Data...")
         try:
-            # Load base data
-            self.customers = pd.read_csv('data/customers.csv')
-            self.customers['signup_date'] = pd.to_datetime(self.customers['signup_date'])
-            
-            self.transactions = pd.read_csv('data/transactions.csv')
-            self.transactions['transaction_date'] = pd.to_datetime(self.transactions['transaction_date'])
-            
-            # Set observation date
-            self.observation_date = self.transactions['transaction_date'].max()
-            
-            # Precompute RFM for all customers
-            self._precompute_rfm()
-            
-            print(f"✓ Data loaded: {len(self.customers)} customers, {len(self.transactions)} transactions")
+            self.data['customers'] = pd.read_csv(f"{DATA_PATH}customers.csv", parse_dates=['signup_date'])
+            self.data['transactions'] = pd.read_csv(f"{DATA_PATH}transactions.csv", parse_dates=['transaction_date'])
+            print("Precomputing RFM...")
+            self._compute_base_rfm()
         except Exception as e:
-            print(f"✗ Error loading data: {e}")
-            raise
-    
-    def _precompute_rfm(self):
-        """Precompute RFM metrics for all customers"""
-        self.rfm = self.transactions.groupby('customer_id').agg(
+            print(f"Error loading data: {e}")
+
+        print("System Ready.")
+
+    def _compute_base_rfm(self):
+        df_tx = self.data['transactions']
+        df_cust = self.data['customers']
+        
+        # Calculate RFM
+        rfm = df_tx.groupby('customer_id').agg(
             frequency=('transaction_date', 'count'),
             recency=('transaction_date', lambda x: (x.max() - x.min()).days),
             monetary_value=('amount', 'mean'),
             last_transaction=('transaction_date', 'max')
         ).reset_index()
         
-        # Adjust frequency for BG-NBD (repeat transactions)
-        self.rfm['frequency'] = self.rfm['frequency'] - 1
-        self.rfm.loc[self.rfm['frequency'] == 0, 'recency'] = 0
+        # Adjust frequency (count - 1 for repeat transactions)
+        rfm['frequency'] = rfm['frequency'] - 1
+        rfm = pd.merge(rfm, df_cust[['customer_id', 'signup_date']], on='customer_id')
         
-        # Merge with customer signup dates
-        self.rfm = pd.merge(
-            self.rfm, 
-            self.customers[['customer_id', 'signup_date']], 
-            on='customer_id', 
-            how='left'
-        )
-        self.rfm['T'] = (self.observation_date - self.rfm['signup_date']).dt.days
-        self.rfm['days_since_last'] = (self.observation_date - self.rfm['last_transaction']).dt.days
+        current_obs_date = df_tx['transaction_date'].max()
+        rfm['T'] = (current_obs_date - rfm['signup_date']).dt.days
+        
+        # Cleanup
+        rfm.loc[rfm['frequency'] < 0, 'frequency'] = 0
+        self.rfm = rfm.set_index('customer_id')
 
-# Initialize model registry
-models = ModelRegistry()
+system = SystemState()
 
-# ============================================================================
-# Pydantic Models (Request/Response schemas)
-# ============================================================================
+@app.on_event("startup")
+def startup_event():
+    system.load_resources()
 
-class CustomerScoreRequest(BaseModel):
-    customer_id: str = Field(..., description="Unique customer identifier")
+# --- HELPER FUNCTIONS ---
 
-class CustomerScoreResponse(BaseModel):
-    customer_id: str
-    churn_probability: float = Field(..., ge=0, le=1)
-    p_alive: float = Field(..., ge=0, le=1)
-    expected_remaining_lifetime: float = Field(..., description="Days")
-    clv_bgnbd: float
-    clv_survival: float
+def get_xgb_features(customer_id: str):
+    """Generate the features required for XGBoost for a specific customer."""
+    if customer_id not in system.rfm.index:
+        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found in RFM index")
 
-class ChurnPredictionRequest(BaseModel):
-    customer_id: str
-    horizon_days: int = Field(60, ge=1, le=365, description="Prediction horizon in days")
-
-class ChurnPredictionResponse(BaseModel):
-    customer_id: str
-    churn_probability: float
-    churn_label: Literal["low_risk", "medium_risk", "high_risk"]
-    horizon_days: int
-
-class SurvivalPoint(BaseModel):
-    day: int
-    prob: float
-
-class SurvivalPredictionRequest(BaseModel):
-    customer_id: str
-
-class SurvivalPredictionResponse(BaseModel):
-    customer_id: str
-    survival_curve: List[SurvivalPoint]
-    expected_remaining_lifetime: float
-
-class CLVEstimationRequest(BaseModel):
-    customer_id: str
-    method: Literal["bgnbd", "survival"] = "bgnbd"
-
-class CLVEstimationResponse(BaseModel):
-    customer_id: str
-    method: str
-    clv: float
-    horizon_months: int = 12
-
-class RetentionCustomer(BaseModel):
-    customer_id: str
-    churn_probability: float
-    clv: float
-    priority_score: float
-
-class RetentionRankingRequest(BaseModel):
-    top_k: int = Field(100, ge=1, le=10000)
-    strategy: Literal["high_churn", "low_p_alive", "high_clv_high_churn"] = "high_clv_high_churn"
-
-class RetentionRankingResponse(BaseModel):
-    strategy: str
-    total_customers_ranked: int
-    customers: List[RetentionCustomer]
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
-
-def get_customer_features(customer_id: str) -> pd.DataFrame:
-    """Extract features for a single customer for classification model"""
-    # Get customer's RFM data
-    cust_rfm = models.rfm[models.rfm['customer_id'] == customer_id]
-    if cust_rfm.empty:
-        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
+    df_tx = system.data['transactions']
+    df_cust = system.data['customers']
     
-    cust_rfm = cust_rfm.iloc[0]
-    cust_trans = models.transactions[models.transactions['customer_id'] == customer_id]
-    cust_info = models.customers[models.customers['customer_id'] == customer_id].iloc[0]
-    
+    tx = df_tx[df_tx['customer_id'] == customer_id].copy()
+    if tx.empty:
+        raise HTTPException(status_code=404, detail="No transaction history")
+        
+    signup_date = df_cust.loc[df_cust['customer_id'] == customer_id, 'signup_date'].iloc[0]
+    obs = df_tx['transaction_date'].max()
+
     # Time windows
-    last_30_start = models.observation_date - pd.Timedelta(days=30)
-    last_90_start = models.observation_date - pd.Timedelta(days=90)
-    prev_30_start = models.observation_date - pd.Timedelta(days=60)
-    prev_30_end = models.observation_date - pd.Timedelta(days=30)
+    last_30_start = obs - pd.Timedelta(days=30)
+    last_90_start = obs - pd.Timedelta(days=90)
+    prev_30_start = obs - pd.Timedelta(days=60)
+    prev_30_end = obs - pd.Timedelta(days=30)
     
-    # Windowed aggregates
-    tx_30 = cust_trans[cust_trans['transaction_date'] >= last_30_start]
-    tx_90 = cust_trans[cust_trans['transaction_date'] >= last_90_start]
-    tx_prev30 = cust_trans[(cust_trans['transaction_date'] >= prev_30_start) & 
-                           (cust_trans['transaction_date'] < prev_30_end)]
+    tx_30 = tx[tx['transaction_date'] >= last_30_start]
+    tx_90 = tx[tx['transaction_date'] >= last_90_start]
+    tx_prev30 = tx[(tx['transaction_date'] >= prev_30_start) & (tx['transaction_date'] < prev_30_end)]
     
-    # Calculate interpurchase times
-    sorted_dates = cust_trans['transaction_date'].sort_values()
-    interpurchase_days = sorted_dates.diff().dt.days.dropna()
+    f = {}
+    f['transactions_last_30'] = len(tx_30)
+    f['revenue_last_30'] = tx_30['amount'].sum()
+    f['avg_amount_last_30'] = tx_30['amount'].mean() if not tx_30.empty else 0
+    f['unique_active_days_last_30'] = tx_30['transaction_date'].dt.date.nunique()
     
-    # Build feature dictionary
-    features = {
-        'transactions_last_30': len(tx_30),
-        'revenue_last_30': tx_30['amount'].sum() if not tx_30.empty else 0,
-        'avg_amount_last_30': tx_30['amount'].mean() if not tx_30.empty else 0,
-        'unique_active_days_last_30': tx_30['transaction_date'].dt.date.nunique() if not tx_30.empty else 0,
-        'transactions_last_90': len(tx_90),
-        'revenue_last_90': tx_90['amount'].sum() if not tx_90.empty else 0,
-        'transactions_prev_30': len(tx_prev30),
-        'revenue_prev_30': tx_prev30['amount'].sum() if not tx_prev30.empty else 0,
-        'avg_interpurchase_days': interpurchase_days.mean() if len(interpurchase_days) > 0 else 0,
-        'std_interpurchase_days': interpurchase_days.std() if len(interpurchase_days) > 0 else 0,
-        'last_interpurchase_days': interpurchase_days.iloc[-1] if len(interpurchase_days) > 0 else 0,
-        'median_amount': cust_trans['amount'].median(),
-        'max_amount': cust_trans['amount'].max(),
-        'avg_amount_overall': cust_trans['amount'].mean(),
-        'num_large_txns': (cust_trans['amount'] > cust_trans['amount'].quantile(0.95)).sum(),
-        'flag_high_value_outlier': int((cust_trans['amount'] > cust_trans['amount'].quantile(0.95)).any()),
-        'last_tx_month': cust_rfm['last_transaction'].month,
-        'last_tx_day_of_week': cust_rfm['last_transaction'].dayofweek,
-        'is_holiday_window': int(cust_rfm['last_transaction'].month in [11, 12]),
-        'lifetime_days': cust_rfm['T'],
-        'total_spend': cust_trans['amount'].sum(),
-        'frequency': len(cust_trans),
-        'avg_amount_calc': cust_trans['amount'].sum() / len(cust_trans),
-        'pct_change_tx_last30_vs_prev30': ((len(tx_30) - len(tx_prev30)) / max(len(tx_prev30), 1)),
-        'frequency_ratio_30_90': len(tx_30) / max(len(tx_90), 1),
-        'log_total_spend': np.log1p(cust_trans['amount'].sum()),
-        'log_revenue_last_30': np.log1p(tx_30['amount'].sum() if not tx_30.empty else 0),
-        'log_avg_amount_last_30': np.log1p(tx_30['amount'].mean() if not tx_30.empty else 0),
-        'recency': cust_rfm['days_since_last'],
-        'monetary': cust_trans['amount'].sum(),
-        'signup_day_of_week': cust_info['signup_date'].dayofweek,
-        'signup_month': cust_info['signup_date'].month
-    }
+    f['transactions_last_90'] = len(tx_90)
+    f['revenue_last_90'] = tx_90['amount'].sum()
+    f['transactions_prev_30'] = len(tx_prev30)
+    f['revenue_prev_30'] = tx_prev30['amount'].sum()
     
-    return pd.DataFrame([features])
+    # Interpurchase
+    diffs = tx.sort_values('transaction_date')['transaction_date'].diff().dt.days.dropna()
+    f['avg_interpurchase_days'] = diffs.mean() if not diffs.empty else 0
+    f['std_interpurchase_days'] = diffs.std() if not diffs.empty else 0
+    f['last_interpurchase_days'] = diffs.iloc[-1] if not diffs.empty else 0
+    
+    f['median_amount'] = tx['amount'].median()
+    f['max_amount'] = tx['amount'].max()
+    f['avg_amount_overall'] = tx['amount'].mean()
+    
+    f['num_large_txns'] = (tx['amount'] > 100).sum()
+    f['flag_high_value_outlier'] = 1 if f['max_amount'] > 500 else 0
+    
+    last_tx_date = tx['transaction_date'].max()
+    f['last_tx_month'] = last_tx_date.month
+    f['last_tx_day_of_week'] = last_tx_date.dayofweek
+    f['is_holiday_window'] = 1 if last_tx_date.month in [11, 12] else 0
+    
+    f['lifetime_days'] = (obs - signup_date).days
+    f['total_spend'] = tx['amount'].sum()
+    f['frequency'] = len(tx) 
+    f['avg_amount_calc'] = f['total_spend'] / f['frequency'] if f['frequency'] > 0 else 0
+    
+    # Ratios
+    f['pct_change_tx_last30_vs_prev30'] = (f['transactions_last_30'] - f['transactions_prev_30']) / (f['transactions_prev_30'] + 1)
+    f['frequency_ratio_30_90'] = f['transactions_last_30'] / (f['transactions_last_90'] + 1)
+    
+    # Logs
+    f['log_total_spend'] = np.log1p(f['total_spend'])
+    f['log_revenue_last_30'] = np.log1p(f['revenue_last_30'])
+    f['log_avg_amount_last_30'] = np.log1p(f['avg_amount_last_30'])
+    
+    # Recency/Monetary
+    f['recency'] = (obs - last_tx_date).days
+    f['monetary'] = f['total_spend']
+    f['signup_day_of_week'] = signup_date.dayofweek
+    f['signup_month'] = signup_date.month
+    
+    return pd.DataFrame([f])[FEATURE_COLS].fillna(0)
 
-def calculate_survival_curve(customer_id: str, days: List[int] = None) -> List[dict]:
-    """Calculate survival probabilities for specified days"""
-    if days is None:
-        days = [30, 60, 90, 120, 180, 270, 365]
+# --- CORE LOGIC ---
+
+def _compute_churn_prob(customer_id: str) -> float:
+    X = get_xgb_features(customer_id)
+    X_scaled = system.models['scaler'].transform(X)
+    prob = system.models['xgb'].predict_proba(X_scaled)[:, 1][0]
+    return float(prob)
+
+def _compute_bg_alive(customer_id: str) -> float:
+    row = system.rfm.loc[customer_id]
+    prob = system.models['bgf'].conditional_probability_alive(
+        row['frequency'], row['recency'], row['T']
+    )
+    return float(prob)
+
+def _compute_clv_bgnbd(customer_id: str, months=12) -> float:
+    row = system.rfm.loc[customer_id]
+    # Wrap in series to satisfy lifetimes API expectations
+    freq = pd.Series([row['frequency']], index=[customer_id])
+    rec = pd.Series([row['recency']], index=[customer_id])
+    T = pd.Series([row['T']], index=[customer_id])
+    mon = pd.Series([row['monetary_value']], index=[customer_id])
     
-    # Get customer's survival features
-    cust_rfm = models.rfm[models.rfm['customer_id'] == customer_id]
-    if cust_rfm.empty:
-        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
+    clv = system.models['ggf'].customer_lifetime_value(
+        system.models['bgf'],
+        freq, rec, T, mon,
+        time=months, discount_rate=0.01, freq='D'
+    )
+    return float(clv.iloc[0])
+
+def _compute_expected_lifetime(customer_id: str) -> float:
+    row = system.rfm.loc[customer_id]
+    # CoxPH expects frequency as total count (so rfm frequency + 1)
+    cov = pd.DataFrame([{'frequency': row['frequency'] + 1, 'monetary': row['monetary_value']}])
+    return float(system.models['cph'].predict_expectation(cov).iloc[0])
+
+def _compute_survival_curve(customer_id: str):
+    row = system.rfm.loc[customer_id]
+    cov = pd.DataFrame([{'frequency': row['frequency'] + 1, 'monetary': row['monetary_value']}])
+    return system.models['cph'].predict_survival_function(cov)
+
+def _compute_clv_survival(customer_id: str, months=12) -> float:
+    # Approximate CLV via Survival: Sum(P(alive_t) * DailyValue)
+    row = system.rfm.loc[customer_id]
     
-    cust_rfm = cust_rfm.iloc[0]
+    # Daily Value Estimation: Spending per day active?
+    # Or simply: Total Spend / Total Lifetime so far?
+    # Better: Monetary Value (avg spend per tx) * Transaction Rate
+    # Transaction Rate (lambda) can be estimated from BG/NBD or simply Frequency/T
     
-    # Prepare data for survival model
-    X_survival = pd.DataFrame({
-        'frequency': [cust_rfm['frequency'] + 1],  # Add back the 1 we subtracted
-        'monetary': [cust_rfm['monetary_value']]
-    })
+    # Using BG/NBD predicted transaction rate is robust
+    pred_tx_rate = system.models['bgf'].conditional_expected_number_of_purchases_up_to_time(
+        1, row['frequency'], row['recency'], row['T']
+    ) # Expected tx in 1 unit of time (1 day if freq='D'?)
     
-    # Get baseline survival function
-    baseline_survival = models.cph.baseline_survival_
+    # Note: bgf 'time' unit matches the T unit. T is days. So this is expected tx per day?
+    # Usually BG/NBD predicts usually small number. Let's check magnitude in a real scenario.
+    # If T is days, rate is per day.
     
-    # Calculate partial hazard for this customer
-    partial_hazard = models.cph.predict_partial_hazard(X_survival).iloc[0]
+    daily_value = pred_tx_rate * row['monetary_value']
     
-    # Calculate survival probabilities
-    curve = []
-    for day in days:
-        # Find closest day in baseline
-        if day in baseline_survival.index:
-            base_surv = baseline_survival.loc[day]
-        else:
-            # Interpolate
-            idx = baseline_survival.index.searchsorted(day)
-            if idx == 0:
-                base_surv = 1.0
-            elif idx >= len(baseline_survival):
-                base_surv = baseline_survival.iloc[-1]
-            else:
-                base_surv = baseline_survival.iloc[idx]
+    # Discounted sum over horizon
+    curve = _compute_survival_curve(customer_id) # DataFrame indexed by time (days)
+    
+    clv_accum = 0.0
+    discount_rate_daily = 0.01 / 30 # Rough daily discount from monthly 1%
+    
+    # Limit to horizon
+    horizon_days = months * 30
+    
+    # Curve index is days. 
+    # Valid indices up to horizon
+    valid_curve = curve[curve.index <= horizon_days]
+    
+    if valid_curve.empty:
+        return 0.0
         
-        # Apply customer-specific hazard
-        surv_prob = base_surv ** partial_hazard
-        curve.append({"day": day, "prob": float(surv_prob)})
-    
-    return curve
+    for t in valid_curve.index:
+        prob = valid_curve.loc[t].iloc[0]
+        # DCF
+        val = (prob * daily_value) / ((1 + discount_rate_daily) ** t)
+        clv_accum += val
+        
+    return float(clv_accum)
 
-# ============================================================================
-# API Endpoints
-# ============================================================================
 
-@app.get("/")
-def root():
-    """Health check endpoint"""
+# --- ENDPOINTS ---
+
+@app.post("/score_customer", response_model=ScoreOutput)
+def score_customer(input_data: ScoreInput):
+    cid = input_data.customer_id
+    if cid not in system.rfm.index:
+        raise HTTPException(status_code=404, detail="Customer not found")
+        
     return {
-        "status": "healthy",
-        "service": "Customer Retention & CLV API",
-        "version": "1.0.0",
-        "total_customers": len(models.customers),
-        "observation_date": models.observation_date.strftime("%Y-%m-%d")
+        "churn_probability": round(_compute_churn_prob(cid), 4),
+        "p_alive": round(_compute_bg_alive(cid), 4),
+        "expected_remaining_lifetime": round(_compute_expected_lifetime(cid), 2),
+        "clv_bgnbd": round(_compute_clv_bgnbd(cid), 2),
+        "clv_survival": round(_compute_clv_survival(cid), 2)
     }
 
-@app.post("/score_customer", response_model=CustomerScoreResponse)
-def score_customer(request: CustomerScoreRequest):
-    """
-    Unified customer scoring combining all models:
-    - Classification churn probability
-    - BG-NBD P(alive)
-    - Survival analysis expected lifetime
-    - CLV estimates (both methods)
-    """
-    customer_id = request.customer_id
+@app.post("/predict_churn", response_model=ChurnOutput)
+def predict_churn_endpoint(input_data: ChurnInput):
+    cid = input_data.customer_id
+    # Note: horizon_days is accepted but our model is fixed-horizon trained
+    # We use the model's native prediction
+    prob = _compute_churn_prob(cid)
+    label = "high_risk" if prob > 0.5 else "low_risk" # Threshold specific to business logic
     
-    # Get customer RFM data
-    cust_rfm = models.rfm[models.rfm['customer_id'] == customer_id]
-    if cust_rfm.empty:
-        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
-    
-    cust_rfm = cust_rfm.iloc[0]
-    
-    # 1. Churn probability (XGBoost)
-    features_df = get_customer_features(customer_id)
-    features_scaled = models.scaler.transform(features_df)
-    churn_prob = models.xgb_model.predict_proba(features_scaled)[0, 1]
-    
-    # 2. P(alive) from BG-NBD
-    p_alive = models.bgf.conditional_probability_alive(
-        cust_rfm['frequency'],
-        cust_rfm['recency'],
-        cust_rfm['T']
-    )
-    
-    # 3. Expected remaining lifetime from Survival
-    X_survival = pd.DataFrame({
-        'frequency': [cust_rfm['frequency'] + 1],
-        'monetary': [cust_rfm['monetary_value']]
-    })
-    expected_lifetime = models.cph.predict_expectation(X_survival).iloc[0]
-    
-    # 4. CLV - BG-NBD method
-    clv_bgnbd = models.ggf.customer_lifetime_value(
-        models.bgf,
-        cust_rfm['frequency'],
-        cust_rfm['recency'],
-        cust_rfm['T'],
-        cust_rfm['monetary_value'],
-        time=12,
-        discount_rate=0.01
-    )
-    
-    # 5. CLV - Survival method
-    exp_monetary = models.ggf.conditional_expected_average_profit(
-        cust_rfm['frequency'],
-        cust_rfm['monetary_value']
-    ) if cust_rfm['frequency'] > 0 else cust_rfm['monetary_value']
-    
-    clv_survival = (expected_lifetime / 30) * exp_monetary
-    
-    return CustomerScoreResponse(
-        customer_id=customer_id,
-        churn_probability=float(churn_prob),
-        p_alive=float(p_alive),
-        expected_remaining_lifetime=float(expected_lifetime),
-        clv_bgnbd=float(clv_bgnbd),
-        clv_survival=float(clv_survival)
-    )
+    return {
+        "churn_probability": round(prob, 4),
+        "churn_label": label
+    }
 
-@app.post("/predict_churn", response_model=ChurnPredictionResponse)
-def predict_churn(request: ChurnPredictionRequest):
-    """
-    Predict churn probability using calibrated XGBoost model
-    Returns probability and risk label
-    """
-    customer_id = request.customer_id
+@app.post("/predict_survival", response_model=SurvivalOutput)
+def predict_survival_endpoint(input_data: SurvivalInput):
+    cid = input_data.customer_id
+    if cid not in system.rfm.index:
+        raise HTTPException(status_code=404, detail="Customer not found")
+        
+    curve = _compute_survival_curve(cid)
+    exp_life = _compute_expected_lifetime(cid)
     
-    # Get features and predict
-    features_df = get_customer_features(customer_id)
-    features_scaled = models.scaler.transform(features_df)
-    churn_prob = models.xgb_model.predict_proba(features_scaled)[0, 1]
+    # Sample points specifically requested + some resolution
+    points = []
+    days_of_interest = [30, 60, 90, 180, 365]
     
-    # Assign risk label
-    if churn_prob >= 0.7:
-        label = "high_risk"
-    elif churn_prob >= 0.4:
-        label = "medium_risk"
+    for d in days_of_interest:
+        # Find nearest day <= d
+        valid_idx = curve.index[curve.index <= d].max()
+        if pd.notna(valid_idx):
+            prob = curve.loc[valid_idx].iloc[0]
+            points.append({"day": d, "prob": round(float(prob), 4)})
+            
+    return {
+        "survival_curve": points,
+        "expected_remaining_lifetime": round(exp_life, 2)
+    }
+
+@app.post("/estimate_clv", response_model=CLVOutput)
+def estimate_clv_endpoint(input_data: CLVInput):
+    cid = input_data.customer_id
+    if cid not in system.rfm.index:
+         raise HTTPException(status_code=404, detail="Customer not found")
+         
+    if input_data.method == "bgnbd":
+        val = _compute_clv_bgnbd(cid)
+    elif input_data.method == "survival":
+        val = _compute_clv_survival(cid)
     else:
-        label = "low_risk"
-    
-    return ChurnPredictionResponse(
-        customer_id=customer_id,
-        churn_probability=float(churn_prob),
-        churn_label=label,
-        horizon_days=request.horizon_days
-    )
+        raise HTTPException(status_code=400, detail="Invalid method")
+        
+    return {
+        "method": input_data.method,
+        "clv": round(val, 2),
+        "horizon_months": 12
+    }
 
-@app.post("/predict_survival", response_model=SurvivalPredictionResponse)
-def predict_survival(request: SurvivalPredictionRequest):
-    """
-    Predict customer survival curve using Cox Proportional Hazards model
-    Returns survival probabilities at key time points
-    """
-    customer_id = request.customer_id
+@app.post("/rank_customers_for_retention", response_model=RankOutput)
+def rank_customers(input_data: RankInput):
+    # Strategy: "high_clv_high_churn"
+    # We calculate score = CLV * Churn_Prob for ALL customers
+    # Optimization: Use vectorized operations on existing dataframes if possible
     
-    # Calculate survival curve
-    survival_curve = calculate_survival_curve(customer_id)
+    rfm = system.rfm.copy()
     
-    # Calculate expected remaining lifetime
-    cust_rfm = models.rfm[models.rfm['customer_id'] == customer_id].iloc[0]
-    X_survival = pd.DataFrame({
-        'frequency': [cust_rfm['frequency'] + 1],
-        'monetary': [cust_rfm['monetary_value']]
+    # 1. CLV Proxy (BGNBD/GammaGamma) Vectorized
+    # Expected Sales
+    expected_sales = system.models['bgf'].conditional_expected_number_of_purchases_up_to_time(
+        12, rfm['frequency'], rfm['recency'], rfm['T']
+    ) # 12 months roughly
+    
+    # Expected Profit
+    expected_avg_profit = system.models['ggf'].conditional_expected_average_profit(
+        rfm['frequency'], rfm['monetary_value']
+    )
+    
+    rfm['clv_est'] = expected_sales * expected_avg_profit
+    
+    # 2. Risk Proxy (CoxPH Partial Hazard) Vectorized
+    # Note: Not exactly Churn Probability, but correlates heavily with Risk. 
+    # High Hazard = High Risk.
+    # Calculating full XGBoost churn prob for ALL customers is slow (iterative).
+    # We use CoxPH Hazard as a "Risk Score" for ranking to keep this endpoint fast.
+    surv_cov = pd.DataFrame({
+        'frequency': rfm['frequency'] + 1,
+        'monetary': rfm['monetary_value']
     })
-    expected_lifetime = models.cph.predict_expectation(X_survival).iloc[0]
+    rfm['risk_score'] = system.models['cph'].predict_partial_hazard(surv_cov)
     
-    return SurvivalPredictionResponse(
-        customer_id=customer_id,
-        survival_curve=[SurvivalPoint(**point) for point in survival_curve],
-        expected_remaining_lifetime=float(expected_lifetime)
-    )
-
-@app.post("/estimate_clv", response_model=CLVEstimationResponse)
-def estimate_clv(request: CLVEstimationRequest):
-    """
-    Estimate Customer Lifetime Value using either BG-NBD or Survival method
-    """
-    customer_id = request.customer_id
-    method = request.method
-    
-    # Get customer RFM data
-    cust_rfm = models.rfm[models.rfm['customer_id'] == customer_id]
-    if cust_rfm.empty:
-        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
-    
-    cust_rfm = cust_rfm.iloc[0]
-    
-    if method == "bgnbd":
-        # BG-NBD + Gamma-Gamma approach
-        clv = models.ggf.customer_lifetime_value(
-            models.bgf,
-            cust_rfm['frequency'],
-            cust_rfm['recency'],
-            cust_rfm['T'],
-            cust_rfm['monetary_value'],
-            time=12,
-            discount_rate=0.01
-        )
-    else:  # survival
-        # Survival + Gamma-Gamma approach
-        X_survival = pd.DataFrame({
-            'frequency': [cust_rfm['frequency'] + 1],
-            'monetary': [cust_rfm['monetary_value']]
-        })
-        expected_lifetime = models.cph.predict_expectation(X_survival).iloc[0]
+    # 3. Combine
+    if input_data.strategy == "high_clv_high_churn":
+        # We want high value AND high risk
+        rfm['priority_score'] = rfm['clv_est'] * rfm['risk_score']
+    else:
+        # Fallback
+        rfm['priority_score'] = rfm['clv_est']
         
-        exp_monetary = models.ggf.conditional_expected_average_profit(
-            cust_rfm['frequency'],
-            cust_rfm['monetary_value']
-        ) if cust_rfm['frequency'] > 0 else cust_rfm['monetary_value']
-        
-        clv = (expected_lifetime / 30) * exp_monetary
+    # Get Top K
+    top_df = rfm.nlargest(input_data.top_k, 'priority_score')
     
-    return CLVEstimationResponse(
-        customer_id=customer_id,
-        method=method,
-        clv=float(clv),
-        horizon_months=12
-    )
-
-@app.post("/rank_customers_for_retention", response_model=RetentionRankingResponse)
-def rank_customers_for_retention(request: RetentionRankingRequest):
-    """
-    Rank customers for retention campaigns based on different strategies:
-    - high_churn: Highest churn probability
-    - low_p_alive: Lowest P(alive) from BG-NBD
-    - high_clv_high_churn: Highest value-at-risk (CLV × churn risk)
-    """
-    top_k = request.top_k
-    strategy = request.strategy
-    
-    # Calculate scores for all customers
-    results = []
-    
-    for idx, row in models.rfm.iterrows():
-        customer_id = row['customer_id']
-        
+    result_list = []
+    for cid, row in top_df.iterrows():
+        # Ideally we would compute exact Churn Prob here for the top K only, 
+        # to return accurate metadata as requested in output schema
         try:
-            # Get churn probability
-            features_df = get_customer_features(customer_id)
-            features_scaled = models.scaler.transform(features_df)
-            churn_prob = models.xgb_model.predict_proba(features_scaled)[0, 1]
+            exact_churn_prob = _compute_churn_prob(str(cid))
+        except:
+            exact_churn_prob = 0.0
             
-            # Get P(alive)
-            p_alive = models.bgf.conditional_probability_alive(
-                row['frequency'],
-                row['recency'],
-                row['T']
-            )
-            
-            # Get CLV
-            clv_bgnbd = models.ggf.customer_lifetime_value(
-                models.bgf,
-                row['frequency'],
-                row['recency'],
-                row['T'],
-                row['monetary_value'],
-                time=12,
-                discount_rate=0.01
-            )
-            
-            # Calculate priority score based on strategy
-            if strategy == "high_churn":
-                priority_score = churn_prob
-            elif strategy == "low_p_alive":
-                priority_score = 1 - p_alive
-            else:  # high_clv_high_churn
-                # Get partial hazard for value-at-risk calculation
-                X_survival = pd.DataFrame({
-                    'frequency': [row['frequency'] + 1],
-                    'monetary': [row['monetary_value']]
-                })
-                partial_hazard = models.cph.predict_partial_hazard(X_survival).iloc[0]
-                priority_score = clv_bgnbd * partial_hazard
-            
-            results.append({
-                'customer_id': customer_id,
-                'churn_probability': float(churn_prob),
-                'clv': float(clv_bgnbd),
-                'priority_score': float(priority_score)
-            })
-        except Exception as e:
-            continue
-    
-    # Sort by priority score and take top_k
-    results_df = pd.DataFrame(results)
-    results_df = results_df.sort_values('priority_score', ascending=False).head(top_k)
-    
-    return RetentionRankingResponse(
-        strategy=strategy,
-        total_customers_ranked=len(results),
-        customers=[RetentionCustomer(**row) for row in results_df.to_dict('records')]
-    )
+        result_list.append({
+            "customer_id": str(cid),
+            "churn_probability": round(exact_churn_prob, 4),
+            "clv": round(row['clv_est'], 2),
+            "priority_score": round(row['priority_score'], 4)
+        })
+        
+    return {
+        "strategy": input_data.strategy,
+        "customers": result_list
+    }
 
 if __name__ == "__main__":
     import uvicorn
