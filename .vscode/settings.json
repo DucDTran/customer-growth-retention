@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^/opt/homebrew/bin/pdftotext /Users/duc\\.tran/customer-growth-retention/project_requirements\\.pdf -$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^/Users/duc\\.tran/customer-growth-retention/\\.venv/bin/python main\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
